@@ -14,6 +14,10 @@ import {
 import { createEngineMaterials, EngineMaterialLibrary } from './materials';
 import { createProceduralTextures, ProceduralTextureSet } from './textures';
 import {
+  ArMode,
+  ArPlacementPhase,
+  ArScaleMode,
+  ArStatus,
   CAMERA_PRESETS,
   CameraPresetId,
   ComponentId,
@@ -28,14 +32,15 @@ export interface V12SceneCallbacks {
   onTelemetry: (telemetry: EngineTelemetry) => void;
   onSelectComponent: (componentId: ComponentId | null) => void;
   onHoverComponent: (componentId: ComponentId | null) => void;
+  onArStatusChange: (status: ArStatus) => void;
   onRpmSync?: (rpm: number) => void;
 }
 
 export interface V12SceneState {
   isPlaying: boolean;
   targetRpm: number;
-  timeScale: number; // 1.0 = real speed (capped visually for smoothness), 0.1 = slow-mo, 0.02 = ultra-slow
-  explodeAmount: number; // 0..1
+  timeScale: number;
+  explodeAmount: number;
   viewMode: ViewMode;
   finishId: FinishId;
   lightingId: LightingId;
@@ -65,6 +70,12 @@ const _targetControlsLook = new THREE.Vector3();
 const _bgColorTarget = new THREE.Color();
 const _floorColorTarget = new THREE.Color();
 const _tmpColor = new THREE.Color();
+const _planeHitPoint = new THREE.Vector3();
+const _groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+const _reticlePos = new THREE.Vector3();
+const _reticleQuat = new THREE.Quaternion();
+const _reticleScale = new THREE.Vector3();
+const _xrCamWorldPos = new THREE.Vector3();
 
 function detectSoftwareWebGL(): boolean {
   try {
@@ -96,6 +107,15 @@ export class V12SceneController {
   private materials: EngineMaterialLibrary;
   private rig: V12AssemblyRig;
   private studioGeos: THREE.BufferGeometry[] = [];
+  private arExtraMats: THREE.Material[] = [];
+
+  // Scene hierarchy groups
+  private studioPlinthGroup: THREE.Group;
+  private arEngineAnchor: THREE.Group;
+  private arContactShadow: THREE.Mesh;
+  private reticleGroup: THREE.Group;
+  private reticleInnerRing: THREE.Mesh;
+  private arPreviewGrid: THREE.Group;
 
   // Lights
   private keyLight: THREE.DirectionalLight;
@@ -103,11 +123,11 @@ export class V12SceneController {
   private rimLight: THREE.DirectionalLight;
   private softboxes: THREE.RectAreaLight[] = [];
 
-  // State
+  // Engine Simulation State
   private state: V12SceneState = {
     isPlaying: true,
     targetRpm: 1200,
-    timeScale: 0.08, // Default mechanical inspection cadence so valves & pistons read crisply
+    timeScale: 0.08,
     explodeAmount: 0,
     viewMode: 'assembled',
     finishId: 'rosso',
@@ -123,6 +143,23 @@ export class V12SceneController {
   private currentExplode = 0;
   private selectedComponent: ComponentId | null = null;
   private hoveredComponent: ComponentId | null = null;
+
+  // WebXR & AR Placement State
+  private arStatus: ArStatus = {
+    webxrSupported: false,
+    mode: 'studio',
+    phase: 'idle',
+    scaleMode: 'tabletop',
+    errorMessage: null,
+  };
+  private xrSession: XRSession | null = null;
+  private xrController: THREE.XRTargetRaySpace;
+  private hitTestSource: XRHitTestSource | null = null;
+  private hitTestSourceRequested = false;
+  private arSpawnScaleCurrent = 1.0;
+  private arSpawnScaleTarget = 1.0;
+  private previewScanTimer = 0;
+  private reticlePulsePhase = 0;
 
   // Camera transition state
   private camAnimating = false;
@@ -146,6 +183,7 @@ export class V12SceneController {
   private handlePointerUpBound: (e: PointerEvent) => void;
   private handleContextLostBound: (e: Event) => void;
   private handleContextRestoredBound: () => void;
+  private handleXrSelectBound: () => void;
 
   constructor(container: HTMLElement, callbacks: V12SceneCallbacks) {
     this.container = container;
@@ -155,9 +193,10 @@ export class V12SceneController {
     const width = Math.max(1, container.clientWidth);
     const height = Math.max(1, container.clientHeight);
 
-    // 1. Renderer
+    // 1. WebGLRenderer with alpha: true & WebXR enabled for transparent AR camera passthrough
     this.renderer = new THREE.WebGLRenderer({
       antialias: !this.isSoftwareGl,
+      alpha: true,
       powerPreference: 'high-performance',
     });
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -167,6 +206,7 @@ export class V12SceneController {
     this.renderer.setSize(width, height);
     this.renderer.shadowMap.enabled = !this.isSoftwareGl;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.xr.enabled = true;
     this.renderer.domElement.style.display = 'block';
     this.renderer.domElement.style.width = '100%';
     this.renderer.domElement.style.height = '100%';
@@ -185,8 +225,8 @@ export class V12SceneController {
     roomEnv.dispose();
     pmremGenerator.dispose();
 
-    // 3. Camera & Controls
-    this.camera = new THREE.PerspectiveCamera(38, width / height, 0.15, 120);
+    // 3. Camera & OrbitControls
+    this.camera = new THREE.PerspectiveCamera(38, width / height, 0.05, 120);
     const heroCam = CAMERA_PRESETS[0];
     this.camera.position.set(...heroCam.position);
 
@@ -196,11 +236,10 @@ export class V12SceneController {
     this.controls.dampingFactor = 0.06;
     this.controls.minDistance = 3.2;
     this.controls.maxDistance = 24;
-    this.controls.maxPolarAngle = Math.PI * 0.488; // keep camera above studio plinth
+    this.controls.maxPolarAngle = Math.PI * 0.488;
     this.controls.autoRotate = false;
     this.controls.autoRotateSpeed = 0.65;
     this.controls.addEventListener('start', () => {
-      // Never fight manual user camera drag
       this.camAnimating = false;
     });
     this.controls.update();
@@ -232,7 +271,6 @@ export class V12SceneController {
     this.rimLight.position.set(-9.0, 6.5, -8.5);
     this.scene.add(this.rimLight);
 
-    // Elongated studio softboxes for crisp automotive specular highlights (skipped on software WebGL)
     if (!this.isSoftwareGl) {
       RectAreaLightUniformsLib.init();
       const topStrip = new THREE.RectAreaLight(0xffffff, initLight.softboxIntensity, 9.5, 2.2);
@@ -248,23 +286,57 @@ export class V12SceneController {
       this.softboxes.push(topStrip, sideStrip);
     }
 
-    // 5. Procedural Textures, PBR Materials & Full V12 Engine Geometry
+    // 5. Procedural Textures, PBR Materials & Full V12 Engine Geometry inside AR Anchor
     const maxAniso = this.renderer.capabilities.getMaxAnisotropy();
     this.textures = createProceduralTextures(maxAniso);
     this.materials = createEngineMaterials(this.textures, this.isSoftwareGl);
     this.rig = buildV12Engine(this.materials);
-    this.scene.add(this.rig.engineRoot);
 
-    // 6. Grounded Studio Turntable Plinth & Contact Shadow
+    this.arEngineAnchor = new THREE.Group();
+    this.arEngineAnchor.add(this.rig.engineRoot);
+
+    // Dedicated AR contact shadow attached to engine anchor (moves & scales with spawned engine!)
+    const arShadowGeo = new THREE.PlaneGeometry(8.8, 11.2);
+    arShadowGeo.rotateX(-Math.PI / 2);
+    this.studioGeos.push(arShadowGeo);
+    this.arContactShadow = new THREE.Mesh(arShadowGeo, this.materials.contactShadow);
+    this.arContactShadow.position.y = 0.025;
+    this.arEngineAnchor.add(this.arContactShadow);
+
+    this.scene.add(this.arEngineAnchor);
+
+    // 6. Grounded Studio Turntable Plinth
+    this.studioPlinthGroup = new THREE.Group();
     this.buildStudioPlinth();
+    this.scene.add(this.studioPlinthGroup);
 
-    // 7. Apply initial poses & pre-warm shaders (skip compile on software WebGL)
+    // 7. WebXR Surface Detection Reticle & AR Preview Surface Plane Grid
+    const { group: reticle, innerRing } = this.buildSurfaceReticle();
+    this.reticleGroup = reticle;
+    this.reticleInnerRing = innerRing;
+    this.reticleGroup.visible = false;
+    this.scene.add(this.reticleGroup);
+
+    this.arPreviewGrid = this.buildArPreviewSurfaceGrid();
+    this.arPreviewGrid.visible = false;
+    this.scene.add(this.arPreviewGrid);
+
+    // 8. WebXR Controller for screen-tap / controller-trigger select spawning
+    this.xrController = this.renderer.xr.getController(0);
+    this.handleXrSelectBound = this.onXrSelect.bind(this);
+    this.xrController.addEventListener('select', this.handleXrSelectBound);
+    this.scene.add(this.xrController);
+
+    // 9. Probe WebXR immersive-ar capability asynchronously
+    void this.probeWebXRSupport();
+
+    // 10. Apply initial poses & pre-warm shaders
     this.updateKinematics(0);
     if (!this.isSoftwareGl) {
       this.renderer.compile(this.scene, this.camera);
     }
 
-    // 8. Bind events
+    // 11. Bind events
     this.handleResizeBound = this.onResize.bind(this);
     this.handlePointerMoveBound = this.onPointerMove.bind(this);
     this.handlePointerDownBound = this.onPointerDown.bind(this);
@@ -274,7 +346,7 @@ export class V12SceneController {
       this.stopLoop();
     };
     this.handleContextRestoredBound = () => {
-      if (!this.isDisposed) this.startLoop();
+      if (!this.isDisposed && !this.xrSession) this.startLoop();
     };
 
     window.addEventListener('resize', this.handleResizeBound);
@@ -284,48 +356,495 @@ export class V12SceneController {
     this.renderer.domElement.addEventListener('webglcontextlost', this.handleContextLostBound);
     this.renderer.domElement.addEventListener('webglcontextrestored', this.handleContextRestoredBound);
 
-    // 9. Start loop
+    // 12. Start standard render loop
     this.lastTimeMs = performance.now();
     this.startLoop();
   }
 
   private buildStudioPlinth(): void {
-    // Seamless horizon floor plane slightly below plinth
     const floorGeo = new THREE.CircleGeometry(36, 64);
     floorGeo.rotateX(-Math.PI / 2);
     this.studioGeos.push(floorGeo);
     const floor = new THREE.Mesh(floorGeo, this.materials.floorPlinth);
     floor.position.y = -0.10;
     floor.receiveShadow = true;
-    this.scene.add(floor);
+    this.studioPlinthGroup.add(floor);
 
-    // Elevated brushed architectural turntable disc (sits flush at y = 0)
     const plinthGeo = new THREE.CylinderGeometry(6.9, 7.15, 0.12, 72);
     this.studioGeos.push(plinthGeo);
     const plinth = new THREE.Mesh(plinthGeo, this.materials.floorPlinth);
     plinth.position.y = -0.06;
     plinth.receiveShadow = true;
-    this.scene.add(plinth);
+    this.studioPlinthGroup.add(plinth);
 
-    // Subtle machined bevel collar around turntable perimeter
     const rimGeo = new THREE.TorusGeometry(6.94, 0.035, 10, 96);
     rimGeo.rotateX(Math.PI / 2);
     this.studioGeos.push(rimGeo);
     const rim = new THREE.Mesh(rimGeo, this.materials.floorRimAccent);
     rim.position.y = 0.0;
-    this.scene.add(rim);
+    this.studioPlinthGroup.add(rim);
+  }
 
-    // Soft radial contact shadow plane grounded directly beneath engine & cradle (y = 0.025)
-    const shadowPlaneGeo = new THREE.PlaneGeometry(8.8, 11.2);
-    shadowPlaneGeo.rotateX(-Math.PI / 2);
-    this.studioGeos.push(shadowPlaneGeo);
-    const shadowPlane = new THREE.Mesh(shadowPlaneGeo, this.materials.contactShadow);
-    shadowPlane.position.y = 0.025;
-    this.scene.add(shadowPlane);
+  /**
+   * Precision automotive AR surface detection reticle lying flat on the detected plane.
+   * Built at 1.0 unit nominal diameter; scaled to 0.24 m in native WebXR or 1.45 units in preview.
+   */
+  private buildSurfaceReticle(): { group: THREE.Group; innerRing: THREE.Mesh } {
+    const group = new THREE.Group();
+
+    const outerMat = new THREE.MeshBasicMaterial({
+      color: 0xf4f6f9,
+      transparent: true,
+      opacity: 0.92,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    const accentMat = new THREE.MeshBasicMaterial({
+      color: 0xd93829,
+      transparent: true,
+      opacity: 0.95,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    const fillMat = new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.12,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    this.arExtraMats.push(outerMat, accentMat, fillMat);
+
+    // Outer calibrated ring
+    const outerRingGeo = new THREE.RingGeometry(0.42, 0.46, 48);
+    outerRingGeo.rotateX(-Math.PI / 2);
+    this.studioGeos.push(outerRingGeo);
+    const outerRing = new THREE.Mesh(outerRingGeo, outerMat);
+    outerRing.position.y = 0.01;
+    group.add(outerRing);
+
+    // Subtle translucent plane target disc
+    const fillGeo = new THREE.CircleGeometry(0.41, 48);
+    fillGeo.rotateX(-Math.PI / 2);
+    this.studioGeos.push(fillGeo);
+    const fill = new THREE.Mesh(fillGeo, fillMat);
+    fill.position.y = 0.008;
+    group.add(fill);
+
+    // Inner crimson target ring
+    const innerRingGeo = new THREE.RingGeometry(0.16, 0.195, 36);
+    innerRingGeo.rotateX(-Math.PI / 2);
+    this.studioGeos.push(innerRingGeo);
+    const innerRing = new THREE.Mesh(innerRingGeo, accentMat);
+    innerRing.position.y = 0.012;
+    group.add(innerRing);
+
+    // Center dot
+    const dotGeo = new THREE.CircleGeometry(0.032, 18);
+    dotGeo.rotateX(-Math.PI / 2);
+    this.studioGeos.push(dotGeo);
+    const dot = new THREE.Mesh(dotGeo, outerMat);
+    dot.position.y = 0.014;
+    group.add(dot);
+
+    // 4 machined compass ticks around outer ring
+    const tickGeo = new THREE.PlaneGeometry(0.032, 0.14);
+    tickGeo.rotateX(-Math.PI / 2);
+    this.studioGeos.push(tickGeo);
+    for (let i = 0; i < 4; i++) {
+      const a = (i / 4) * Math.PI * 2;
+      const tick = new THREE.Mesh(tickGeo, i === 0 ? accentMat : outerMat);
+      tick.position.set(Math.sin(a) * 0.54, 0.013, Math.cos(a) * 0.54);
+      tick.rotation.y = a;
+      group.add(tick);
+    }
+
+    return { group, innerRing };
+  }
+
+  /**
+   * Subtle spatial plane-detection grid shown during desktop/preview AR surface scanning.
+   */
+  private buildArPreviewSurfaceGrid(): THREE.Group {
+    const group = new THREE.Group();
+    const grid = new THREE.GridHelper(18, 24, 0xd93829, 0x4b5568);
+    const gridMats = Array.isArray(grid.material) ? grid.material : [grid.material];
+    for (const m of gridMats) {
+      m.transparent = true;
+      m.opacity = 0.28;
+      m.depthWrite = false;
+      this.arExtraMats.push(m);
+    }
+    grid.position.y = 0.012;
+    this.studioGeos.push(grid.geometry);
+    group.add(grid);
+    return group;
+  }
+
+  private emitArStatus(): void {
+    this.callbacks.onArStatusChange({ ...this.arStatus });
+  }
+
+  private async probeWebXRSupport(): Promise<void> {
+    try {
+      const xr = navigator.xr;
+      if (xr && typeof xr.isSessionSupported === 'function') {
+        const supported = await xr.isSessionSupported('immersive-ar');
+        if (!this.isDisposed) {
+          this.arStatus.webxrSupported = supported;
+          this.emitArStatus();
+        }
+      }
+    } catch {
+      // WebXR blocked or unavailable in this browser context
+    }
   }
 
   // =========================================================================
-  // PUBLIC CONTROL API
+  // WEBXR IMMERSIVE-AR & SURFACE PLACEMENT API
+  // =========================================================================
+
+  /**
+   * Launches a real WebXR `immersive-ar` hit-test session on supported devices,
+   * or falls back cleanly to interactive Surface Placement Preview mode on desktop browsers.
+   */
+  public async startArExperience(domOverlayRoot?: HTMLElement | null): Promise<void> {
+    this.arStatus.errorMessage = null;
+
+    if (this.arStatus.webxrSupported && navigator.xr) {
+      try {
+        await this.enterNativeWebXR(domOverlayRoot ?? null);
+        return;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Unable to start WebXR AR session.';
+        // Fallback gracefully to interactive AR Surface Placement mode while informing user
+        this.arStatus.errorMessage = `${msg} Switched to AR Surface Preview.`;
+        this.enterArPreviewMode();
+        return;
+      }
+    }
+
+    this.enterArPreviewMode();
+  }
+
+  private async enterNativeWebXR(domOverlayRoot: HTMLElement | null): Promise<void> {
+    const xr = navigator.xr;
+    if (!xr) throw new Error('WebXR API unavailable.');
+
+    const baseInit: XRSessionInit = {
+      requiredFeatures: ['hit-test'],
+      optionalFeatures: domOverlayRoot ? ['dom-overlay', 'local-floor'] : ['local-floor'],
+    };
+    if (domOverlayRoot) {
+      baseInit.domOverlay = { root: domOverlayRoot };
+    }
+
+    let session: XRSession;
+    try {
+      session = await xr.requestSession('immersive-ar', baseInit);
+    } catch {
+      // Retry without dom-overlay in case browser rejects optional overlay root
+      session = await xr.requestSession('immersive-ar', {
+        requiredFeatures: ['hit-test'],
+        optionalFeatures: ['local-floor'],
+      });
+    }
+
+    this.xrSession = session;
+    this.hitTestSource = null;
+    this.hitTestSourceRequested = false;
+
+    // Stop non-XR loop before attaching WebXR session
+    this.stopLoop();
+
+    // Hide studio backdrop & plinth for real camera passthrough
+    document.documentElement.classList.add('xr-active');
+    this.renderer.setClearColor(0x000000, 0);
+    this.scene.background = null;
+    this.scene.fog = null;
+    this.studioPlinthGroup.visible = false;
+    this.arPreviewGrid.visible = false;
+    this.controls.enabled = false;
+    this.camAnimating = false;
+
+    // Hide engine until user detects a flat surface and taps screen!
+    this.arEngineAnchor.visible = false;
+    this.arSpawnScaleCurrent = 0.001;
+    this.arSpawnScaleTarget = this.getTargetArScale('webxr');
+
+    // Prepare reticle for matrix-driven WebXR hit-test poses
+    this.reticleGroup.matrixAutoUpdate = false;
+    this.reticleGroup.visible = false;
+
+    this.arStatus.mode = 'webxr';
+    this.arStatus.phase = 'scanning';
+    this.arStatus.errorMessage = null;
+    this.emitArStatus();
+
+    session.addEventListener('end', () => {
+      this.onNativeWebXREnd();
+    });
+
+    this.renderer.xr.setReferenceSpaceType('local');
+    await this.renderer.xr.setSession(session);
+
+    this.lastTimeMs = performance.now();
+    this.renderer.setAnimationLoop((timestamp: number, frame?: XRFrame) => {
+      this.onXRAnimationFrame(timestamp, frame);
+    });
+  }
+
+  private onNativeWebXREnd(): void {
+    this.renderer.setAnimationLoop(null);
+    if (this.hitTestSource) {
+      try {
+        this.hitTestSource.cancel();
+      } catch {
+        // ignore if already ended
+      }
+      this.hitTestSource = null;
+    }
+    this.hitTestSourceRequested = false;
+    this.xrSession = null;
+
+    this.restoreStudioMode();
+    if (!this.isDisposed) {
+      this.startLoop();
+    }
+  }
+
+  private onXRAnimationFrame(timestamp: number, frame?: XRFrame): void {
+    if (this.isDisposed) return;
+
+    const dt = Math.min(0.05, Math.max(0.001, (timestamp - this.lastTimeMs) / 1000));
+    this.lastTimeMs = timestamp;
+
+    // WebXR Real-World Surface Plane Hit-Testing
+    if (frame && this.arStatus.phase !== 'placed') {
+      const referenceSpace = this.renderer.xr.getReferenceSpace();
+      const session = this.renderer.xr.getSession();
+
+      if (session && !this.hitTestSourceRequested) {
+        this.hitTestSourceRequested = true;
+        session
+          .requestReferenceSpace('viewer')
+          .then((viewerSpace) => {
+            if (typeof session.requestHitTestSource === 'function') {
+              return session.requestHitTestSource({ space: viewerSpace });
+            }
+            return undefined;
+          })
+          .then((source) => {
+            if (source && !this.isDisposed && this.xrSession === session) {
+              this.hitTestSource = source;
+            }
+          })
+          .catch(() => {
+            // Hit-test source failed to initialize
+          });
+      }
+
+      if (this.hitTestSource && referenceSpace) {
+        const hitTestResults = frame.getHitTestResults(this.hitTestSource);
+        if (hitTestResults.length > 0) {
+          const pose = hitTestResults[0].getPose(referenceSpace);
+          if (pose) {
+            // Decompose real-world surface pose and apply calibrated 0.24 m reticle scale
+            this.reticleGroup.matrix.fromArray(pose.transform.matrix);
+            this.reticleGroup.matrix.decompose(_reticlePos, _reticleQuat, _reticleScale);
+            _reticleScale.setScalar(0.24);
+            this.reticleGroup.matrix.compose(_reticlePos, _reticleQuat, _reticleScale);
+            this.reticleGroup.visible = true;
+
+            if (this.arStatus.phase !== 'surface-detected') {
+              this.arStatus.phase = 'surface-detected';
+              this.emitArStatus();
+            }
+          }
+        } else {
+          this.reticleGroup.visible = false;
+          if (this.arStatus.phase !== 'scanning') {
+            this.arStatus.phase = 'scanning';
+            this.emitArStatus();
+          }
+        }
+      }
+    }
+
+    // Animate reticle alignment ring subtly while surface detected
+    if (this.reticleGroup.visible) {
+      this.reticlePulsePhase += dt * 2.2;
+      const s = 1 + Math.sin(this.reticlePulsePhase) * 0.06;
+      this.reticleInnerRing.scale.set(s, 1, s);
+    }
+
+    // Step engine kinematics & smooth spawn scale-up (skip OrbitControls during XR)
+    this.stepSimulation(dt, true);
+    this.renderer.render(this.scene, this.camera);
+  }
+
+  /**
+   * Native WebXR screen-tap / trigger select event: spawns the V12 at the detected surface reticle.
+   */
+  private onXrSelect(): void {
+    if (this.arStatus.mode !== 'webxr') return;
+    if (this.arStatus.phase !== 'surface-detected' || !this.reticleGroup.visible) return;
+
+    this.spawnEngineAtReticle();
+  }
+
+  /**
+   * Interactive AR Surface Placement mode for desktop/non-WebXR browsers so users can
+   * test surface plane detection, live reticle tracking, and tap/click-to-spawn anywhere.
+   */
+  public enterArPreviewMode(): void {
+    if (this.xrSession) return;
+
+    this.arStatus.mode = 'preview';
+    this.arStatus.phase = 'scanning';
+    this.previewScanTimer = 0.45; // brief realistic surface scan lock-on
+
+    // Clear selection & hide engine until user clicks detected surface!
+    this.selectComponent(null);
+    this.arEngineAnchor.visible = false;
+    this.arSpawnScaleCurrent = 0.001;
+    this.arSpawnScaleTarget = this.getTargetArScale('preview');
+
+    // Show detected plane grid and position reticle cleanly on plane
+    this.arPreviewGrid.visible = true;
+    this.reticleGroup.matrixAutoUpdate = true;
+    this.reticleGroup.position.set(0, 0.01, 0);
+    this.reticleGroup.rotation.set(0, 0, 0);
+    this.reticleGroup.scale.setScalar(1.45);
+    this.reticleGroup.visible = false;
+
+    // Tilt camera slightly toward floor plane so user can scan and pick spawn location
+    _targetCamPos.set(6.8, 6.2, 8.2);
+    _targetControlsLook.set(0, 0.4, 0);
+    this.camAnimating = true;
+
+    this.emitArStatus();
+  }
+
+  private getTargetArScale(mode: ArMode): number {
+    if (mode === 'webxr') {
+      // 1 Three.js unit = 0.1 meters (100 mm).
+      // 'full' = 0.10 (true 1:1 6.5L V12 ~72 cm length), 'tabletop' = 0.052 (~38 cm desk scale).
+      return this.arStatus.scaleMode === 'full' ? 0.10 : 0.052;
+    }
+    if (mode === 'preview') {
+      return this.arStatus.scaleMode === 'full' ? 1.0 : 0.72;
+    }
+    return 1.0;
+  }
+
+  private spawnEngineAtReticle(): void {
+    if (this.arStatus.mode === 'webxr') {
+      this.reticleGroup.matrix.decompose(_reticlePos, _reticleQuat, _reticleScale);
+      this.arEngineAnchor.position.copy(_reticlePos);
+
+      // Face engine gracefully toward the user's XR camera at a heroic 35° angle
+      const xrCam = this.renderer.xr.getCamera();
+      xrCam.getWorldPosition(_xrCamWorldPos);
+      const dx = _xrCamWorldPos.x - _reticlePos.x;
+      const dz = _xrCamWorldPos.z - _reticlePos.z;
+      this.arEngineAnchor.rotation.set(0, Math.atan2(dx, dz) - 0.62, 0);
+    } else {
+      // Preview AR surface spawn at exact clicked plane point
+      this.arEngineAnchor.position.set(this.reticleGroup.position.x, 0, this.reticleGroup.position.z);
+      const dx = this.camera.position.x - this.reticleGroup.position.x;
+      const dz = this.camera.position.z - this.reticleGroup.position.z;
+      this.arEngineAnchor.rotation.set(0, Math.atan2(dx, dz) - 0.62, 0);
+
+      // Gently frame the spawned engine on its new spot
+      _targetControlsLook.set(
+        this.arEngineAnchor.position.x,
+        1.85 * this.getTargetArScale('preview'),
+        this.arEngineAnchor.position.z
+      );
+      _targetCamPos.set(
+        this.arEngineAnchor.position.x + 6.4,
+        4.4,
+        this.arEngineAnchor.position.z + 6.8
+      );
+      this.camAnimating = true;
+    }
+
+    this.arSpawnScaleCurrent = 0.005;
+    this.arSpawnScaleTarget = this.getTargetArScale(this.arStatus.mode);
+    this.arEngineAnchor.scale.setScalar(this.arSpawnScaleCurrent);
+    this.arEngineAnchor.visible = true;
+    this.reticleGroup.visible = false;
+    this.arPreviewGrid.visible = false;
+
+    this.arStatus.phase = 'placed';
+    this.emitArStatus();
+  }
+
+  public repositionArEngine(): void {
+    if (this.arStatus.mode === 'studio') return;
+    this.selectComponent(null);
+    this.arEngineAnchor.visible = false;
+    this.arSpawnScaleCurrent = 0.001;
+
+    if (this.arStatus.mode === 'webxr') {
+      this.arStatus.phase = 'scanning';
+      this.reticleGroup.visible = false;
+    } else {
+      this.arPreviewGrid.visible = true;
+      this.reticleGroup.visible = true;
+      this.arStatus.phase = 'surface-detected';
+    }
+    this.emitArStatus();
+  }
+
+  public setArScaleMode(scaleMode: ArScaleMode): void {
+    this.arStatus.scaleMode = scaleMode;
+    if (this.arStatus.mode !== 'studio') {
+      this.arSpawnScaleTarget = this.getTargetArScale(this.arStatus.mode);
+    }
+    this.emitArStatus();
+  }
+
+  public exitArMode(): void {
+    if (this.xrSession) {
+      void this.xrSession.end();
+      return;
+    }
+    if (this.arStatus.mode === 'preview') {
+      this.restoreStudioMode();
+    }
+  }
+
+  private restoreStudioMode(): void {
+    document.documentElement.classList.remove('xr-active');
+    const preset = LIGHTING_PRESETS.find((l) => l.id === this.state.lightingId) ?? LIGHTING_PRESETS[0];
+    this.renderer.setClearColor(preset.bgHex, 1);
+    this.scene.background = new THREE.Color(preset.bgHex);
+    this.scene.fog = new THREE.FogExp2(preset.fogHex, 0.022);
+    this.studioPlinthGroup.visible = true;
+    this.arPreviewGrid.visible = false;
+    this.reticleGroup.visible = false;
+    this.reticleGroup.matrixAutoUpdate = true;
+
+    this.arEngineAnchor.visible = true;
+    this.arEngineAnchor.position.set(0, 0, 0);
+    this.arEngineAnchor.rotation.set(0, 0, 0);
+    this.arEngineAnchor.scale.setScalar(1);
+    this.arSpawnScaleCurrent = 1;
+    this.arSpawnScaleTarget = 1;
+
+    this.controls.enabled = true;
+    this.setCameraPreset('hero');
+
+    this.arStatus.mode = 'studio';
+    this.arStatus.phase = 'idle';
+    this.arStatus.errorMessage = null;
+    this.emitArStatus();
+  }
+
+  // =========================================================================
+  // PUBLIC ENGINE CONTROL API
   // =========================================================================
 
   public setPlaying(playing: boolean): void {
@@ -339,7 +858,7 @@ export class V12SceneController {
 
   public triggerRevBlip(): void {
     this.state.isPlaying = true;
-    this.blipTimer = 1.35; // 1.35s authentic V12 inertial rev blip
+    this.blipTimer = 1.35;
     this.blipPeakRpm = 9150;
   }
 
@@ -365,10 +884,12 @@ export class V12SceneController {
     this.state.lightingId = lightingId;
     const preset = LIGHTING_PRESETS.find((l) => l.id === lightingId) ?? LIGHTING_PRESETS[0];
 
-    _bgColorTarget.set(preset.bgHex);
-    this.scene.background = _bgColorTarget.clone();
-    if (this.scene.fog instanceof THREE.FogExp2) {
-      this.scene.fog.color.set(preset.fogHex);
+    if (this.arStatus.mode !== 'webxr') {
+      _bgColorTarget.set(preset.bgHex);
+      this.scene.background = _bgColorTarget.clone();
+      if (this.scene.fog instanceof THREE.FogExp2) {
+        this.scene.fog.color.set(preset.fogHex);
+      }
     }
     this.renderer.toneMappingExposure = preset.exposure;
     this.keyLight.color.setHex(preset.keyColor);
@@ -397,9 +918,12 @@ export class V12SceneController {
   }
 
   public setCameraPreset(presetId: CameraPresetId): void {
+    if (this.arStatus.mode === 'webxr') return;
     const preset = CAMERA_PRESETS.find((c) => c.id === presetId) ?? CAMERA_PRESETS[0];
-    _targetCamPos.set(...preset.position);
-    _targetControlsLook.set(...preset.target);
+    const ax = this.arEngineAnchor.position.x;
+    const az = this.arEngineAnchor.position.z;
+    _targetCamPos.set(preset.position[0] + ax, preset.position[1], preset.position[2] + az);
+    _targetControlsLook.set(preset.target[0] + ax, preset.target[1], preset.target[2] + az);
     this.camAnimating = true;
   }
 
@@ -415,18 +939,18 @@ export class V12SceneController {
   }
 
   // =========================================================================
-  // RENDER LOOP & SOFTWARE WEBGL PACING
+  // NON-XR RENDER LOOP & SOFTWARE WEBGL PACING
   // =========================================================================
 
   private startLoop(): void {
     this.lastTimeMs = performance.now();
     const tick = () => {
-      if (this.isDisposed) return;
+      if (this.isDisposed || this.xrSession) return;
       const now = performance.now();
       const dt = Math.min(0.05, Math.max(0.001, (now - this.lastTimeMs) / 1000));
       this.lastTimeMs = now;
 
-      this.stepSimulation(dt);
+      this.stepSimulation(dt, false);
       this.renderer.render(this.scene, this.camera);
 
       if (this.isSoftwareGl) {
@@ -447,7 +971,7 @@ export class V12SceneController {
     const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
     gl.flush();
     const poll = () => {
-      if (this.isDisposed) {
+      if (this.isDisposed || this.xrSession) {
         if (sync) gl.deleteSync(sync);
         return;
       }
@@ -471,28 +995,46 @@ export class V12SceneController {
   // REAL-TIME KINEMATICS, DAMPING & TELEMETRY
   // =========================================================================
 
-  private stepSimulation(dt: number): void {
+  private stepSimulation(dt: number, inWebXR: boolean): void {
+    // 0. AR Preview initial surface scan lock-on + reticle breathing
+    if (this.arStatus.mode === 'preview' && this.arStatus.phase === 'scanning') {
+      this.previewScanTimer -= dt;
+      if (this.previewScanTimer <= 0) {
+        this.reticleGroup.visible = true;
+        this.arStatus.phase = 'surface-detected';
+        this.emitArStatus();
+      }
+    }
+    if (!inWebXR && this.reticleGroup.visible) {
+      this.reticlePulsePhase += dt * 2.2;
+      const s = 1 + Math.sin(this.reticlePulsePhase) * 0.06;
+      this.reticleInnerRing.scale.set(s, 1, s);
+    }
+
+    // 0b. Smoothly damp AR engine spawn scale-in and scale-mode switches
+    if (this.arEngineAnchor.visible && Math.abs(this.arSpawnScaleCurrent - this.arSpawnScaleTarget) > 0.0002) {
+      this.arSpawnScaleCurrent = THREE.MathUtils.damp(
+        this.arSpawnScaleCurrent,
+        this.arSpawnScaleTarget,
+        7.5,
+        dt
+      );
+      this.arEngineAnchor.scale.setScalar(this.arSpawnScaleCurrent);
+    }
+
     // 1. Inertial RPM spool & rev-blip envelope
     let desiredRpm = this.state.targetRpm;
     if (this.blipTimer > 0) {
       this.blipTimer = Math.max(0, this.blipTimer - dt);
-      if (this.blipTimer > 0.72) {
-        // Rapid motorsport throttle snap up to 9,150 RPM
-        desiredRpm = this.blipPeakRpm;
-      } else {
-        // Overrun decay back to base target RPM
-        desiredRpm = this.state.targetRpm;
-      }
+      desiredRpm = this.blipTimer > 0.72 ? this.blipPeakRpm : this.state.targetRpm;
     }
-    const rpmLambda = desiredRpm > this.currentRpm ? 8.5 : 3.2; // crisp snap up, natural engine-braking decel
+    const rpmLambda = desiredRpm > this.currentRpm ? 8.5 : 3.2;
     this.currentRpm = THREE.MathUtils.damp(this.currentRpm, desiredRpm, rpmLambda, dt);
     if (Math.abs(this.currentRpm - desiredRpm) < 1) this.currentRpm = desiredRpm;
 
     // 2. Advance crankshaft angle when running
     if (this.state.isPlaying && this.currentRpm > 0.5) {
-      // Real angular velocity = (RPM / 60) * 2 * PI rad/s, scaled by inspection timeScale
       const omegaReal = (this.currentRpm / 60) * Math.PI * 2;
-      // Cap effective visual spin at ~68 rad/s so aliasing never looks backwards at 9,500 RPM @ 1x
       const omegaVisual = Math.min(omegaReal * this.state.timeScale, 68);
       this.crankRad += omegaVisual * dt;
       if (this.crankRad > Math.PI * 4000) {
@@ -511,31 +1053,32 @@ export class V12SceneController {
       );
     }
 
-    // 4. Smoothly damped camera preset choreography
-    if (this.camAnimating) {
-      this.camera.position.x = THREE.MathUtils.damp(this.camera.position.x, _targetCamPos.x, 5.2, dt);
-      this.camera.position.y = THREE.MathUtils.damp(this.camera.position.y, _targetCamPos.y, 5.2, dt);
-      this.camera.position.z = THREE.MathUtils.damp(this.camera.position.z, _targetCamPos.z, 5.2, dt);
-      this.controls.target.x = THREE.MathUtils.damp(this.controls.target.x, _targetControlsLook.x, 5.2, dt);
-      this.controls.target.y = THREE.MathUtils.damp(this.controls.target.y, _targetControlsLook.y, 5.2, dt);
-      this.controls.target.z = THREE.MathUtils.damp(this.controls.target.z, _targetControlsLook.z, 5.2, dt);
+    // 4. Smoothly damped camera preset choreography (non-XR only)
+    if (!inWebXR) {
+      if (this.camAnimating) {
+        this.camera.position.x = THREE.MathUtils.damp(this.camera.position.x, _targetCamPos.x, 5.2, dt);
+        this.camera.position.y = THREE.MathUtils.damp(this.camera.position.y, _targetCamPos.y, 5.2, dt);
+        this.camera.position.z = THREE.MathUtils.damp(this.camera.position.z, _targetCamPos.z, 5.2, dt);
+        this.controls.target.x = THREE.MathUtils.damp(this.controls.target.x, _targetControlsLook.x, 5.2, dt);
+        this.controls.target.y = THREE.MathUtils.damp(this.controls.target.y, _targetControlsLook.y, 5.2, dt);
+        this.controls.target.z = THREE.MathUtils.damp(this.controls.target.z, _targetControlsLook.z, 5.2, dt);
 
-      if (
-        this.camera.position.distanceToSquared(_targetCamPos) < 0.0008 &&
-        this.controls.target.distanceToSquared(_targetControlsLook) < 0.0008
-      ) {
-        this.camera.position.copy(_targetCamPos);
-        this.controls.target.copy(_targetControlsLook);
-        this.camAnimating = false;
+        if (
+          this.camera.position.distanceToSquared(_targetCamPos) < 0.0008 &&
+          this.controls.target.distanceToSquared(_targetControlsLook) < 0.0008
+        ) {
+          this.camera.position.copy(_targetCamPos);
+          this.controls.target.copy(_targetControlsLook);
+          this.camAnimating = false;
+        }
       }
+      this.controls.update();
     }
-
-    this.controls.update();
 
     // 5. Update all mechanical kinematics & combustion visuals
     this.updateKinematics(dt);
 
-    // 6. Throttled React HUD telemetry push (~20 Hz to keep React ultra-light)
+    // 6. Throttled React HUD telemetry push (~20 Hz)
     this.telemetryAccum += dt;
     if (this.telemetryAccum >= 0.05) {
       this.telemetryAccum = 0;
@@ -565,12 +1108,10 @@ export class V12SceneController {
     const sinV = Math.sin(V12_GEO.BANK_ANGLE_RAD);
     const cosV = Math.cos(V12_GEO.BANK_ANGLE_RAD);
 
-    // Rotating crankshaft, rear flywheel, front crank damper
     this.rig.crankshaftGroup.rotation.z = cr;
     this.rig.flywheelSpinGroup.rotation.z = cr;
     this.rig.frontCrankPulley.rotation.z = cr;
 
-    // 4 DOHC camshafts & 4 anodized cam sprockets spin at exact 0.5x crank speed
     for (let i = 0; i < this.rig.camshaftSpinGroups.length; i++) {
       this.rig.camshaftSpinGroups[i].rotation.z = halfCr;
     }
@@ -581,20 +1122,17 @@ export class V12SceneController {
       this.rig.idlerSpinGroups[i].rotation.z = -cr * 1.45;
     }
 
-    // Drive-by-wire throttle butterfly plates open proportionally to RPM (6° idle -> 88° redline)
     const throttleNorm = Math.max(0, Math.min(1, (this.currentRpm - 700) / 8400));
     const butterflyAngle = 0.10 + throttleNorm * 1.42;
     for (let i = 0; i < this.rig.throttleButterflies.length; i++) {
       this.rig.throttleButterflies[i].rotation.x = butterflyAngle;
     }
 
-    // Exhaust thermal glow
     this.materials.updateExhaustHeat(
       this.state.isPlaying ? this.currentRpm : 0,
       this.state.lightingId === 'thermal'
     );
 
-    // 12-Cylinder exact slider-crank, 48-valve actuation & 4-stroke combustion glow
     const showComb = this.state.showCombustion;
     const combVisibilityBoost = this.state.viewMode !== 'assembled' || this.currentExplode > 0.15 ? 1.0 : 0.0;
 
@@ -603,14 +1141,10 @@ export class V12SceneController {
       const rig = this.rig.cylinderRigs[i];
       const kin = solveCylinderKinematics(cfg, cr, _kinScratch);
 
-      // Update piston along its cylinder bore axis
       rig.pistonGroup.position.set(kin.wristX, kin.wristY, cfg.zPos);
-
-      // Update H-beam connecting rod from crankpin to wrist pin
       rig.conrodGroup.position.set(kin.pinX, kin.pinY, cfg.zPos);
       rig.conrodGroup.rotation.z = kin.conrodAngleZ;
 
-      // Update 2 intake valves + helical spring compression
       const intDisp = -kin.intakeLift * V12_GEO.VALVE_MAX_LIFT;
       const intSpringScale = 1 - kin.intakeLift * 0.34;
       for (let v = 0; v < 2; v++) {
@@ -619,7 +1153,6 @@ export class V12SceneController {
         node.springMesh.scale.y = intSpringScale;
       }
 
-      // Update 2 exhaust valves + helical spring compression
       const exhDisp = -kin.exhaustLift * V12_GEO.VALVE_MAX_LIFT;
       const exhSpringScale = 1 - kin.exhaustLift * 0.34;
       for (let v = 0; v < 2; v++) {
@@ -628,7 +1161,6 @@ export class V12SceneController {
         node.springMesh.scale.y = exhSpringScale;
       }
 
-      // Update combustion chamber volumetric glow & spark flash
       const combMat = this.materials.combustionMats[i];
       const sparkMat = this.materials.sparkMats[i];
 
@@ -652,7 +1184,6 @@ export class V12SceneController {
           combMat.color.setRGB(0.24, 0.68, 1.0);
           combMat.opacity = (0.14 + kin.intakeLift * 0.16) * combVisibilityBoost;
         } else {
-          // Compression
           const t = (kin.cycleDeg - 540) / 180;
           combMat.color.setRGB(0.45 + t * 0.45, 0.72, 1.0 - t * 0.4);
           combMat.opacity = (0.12 + t * 0.28) * combVisibilityBoost;
@@ -668,7 +1199,6 @@ export class V12SceneController {
         rig.sparkMesh.visible = false;
       }
 
-      // Copy into zero-GC telemetry slot
       const slot = this.cylinderTelemetry[i];
       slot.cycleAngleDeg = kin.cycleDeg;
       slot.phase = kin.phase;
@@ -681,13 +1211,18 @@ export class V12SceneController {
   }
 
   // =========================================================================
-  // INTERACTIVE RAYCASTING & POINTER EVENTS
+  // INTERACTIVE RAYCASTING, AR SURFACE RETICLE TRACKING & CLICK-TO-SPAWN
   // =========================================================================
 
-  private pickComponent(event: PointerEvent): ComponentId | null {
+  private updatePointerNdc(event: PointerEvent): void {
     const rect = this.renderer.domElement.getBoundingClientRect();
     _pointerNdc.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
     _pointerNdc.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  }
+
+  private pickComponent(event: PointerEvent): ComponentId | null {
+    if (!this.arEngineAnchor.visible) return null;
+    this.updatePointerNdc(event);
     this.raycaster.setFromCamera(_pointerNdc, this.camera);
     const hits = this.raycaster.intersectObjects(this.rig.selectableMeshes, false);
     if (hits.length > 0) {
@@ -697,9 +1232,40 @@ export class V12SceneController {
     return null;
   }
 
+  private updatePreviewReticleFromPointer(event: PointerEvent): boolean {
+    this.updatePointerNdc(event);
+    this.raycaster.setFromCamera(_pointerNdc, this.camera);
+    const hit = this.raycaster.ray.intersectPlane(_groundPlane, _planeHitPoint);
+    if (!hit) return false;
+
+    // Keep reticle within the 16-unit architectural surface zone
+    const maxR = 7.5;
+    const len = Math.hypot(_planeHitPoint.x, _planeHitPoint.z);
+    if (len > maxR) {
+      _planeHitPoint.x = (_planeHitPoint.x / len) * maxR;
+      _planeHitPoint.z = (_planeHitPoint.z / len) * maxR;
+    }
+    this.reticleGroup.position.set(_planeHitPoint.x, 0.01, _planeHitPoint.z);
+    this.reticleGroup.visible = true;
+    if (this.arStatus.phase !== 'surface-detected') {
+      this.arStatus.phase = 'surface-detected';
+      this.emitArStatus();
+    }
+    return true;
+  }
+
   private onPointerMove(event: PointerEvent): void {
+    if (this.arStatus.mode === 'webxr') return;
+
+    // In AR Preview placement mode, track the detected horizontal plane with the reticle
+    if (this.arStatus.mode === 'preview' && this.arStatus.phase !== 'placed') {
+      const hit = this.updatePreviewReticleFromPointer(event);
+      this.renderer.domElement.style.cursor = hit ? 'crosshair' : 'grab';
+      return;
+    }
+
     const now = performance.now();
-    if (now - this.lastHoverCheck < 55) return; // throttled hover raycast
+    if (now - this.lastHoverCheck < 55) return;
     this.lastHoverCheck = now;
 
     const hit = this.pickComponent(event);
@@ -719,8 +1285,21 @@ export class V12SceneController {
   private onPointerUp(event: PointerEvent): void {
     const dx = event.clientX - this.pointerDownPos.x;
     const dy = event.clientY - this.pointerDownPos.y;
-    // Ignore drags (OrbitControls rotations)
-    if (dx * dx + dy * dy > 25) return;
+    if (dx * dx + dy * dy > 25) return; // Ignore camera orbit drags
+
+    // In AR Preview mode, clicking on the detected surface spawns the V12 right at the reticle!
+    if (this.arStatus.mode === 'preview' && this.arStatus.phase !== 'placed') {
+      if (this.updatePreviewReticleFromPointer(event) || this.reticleGroup.visible) {
+        this.spawnEngineAtReticle();
+      }
+      return;
+    }
+
+    // In WebXR DOM-overlay fallback taps directly on canvas, also allow spawning
+    if (this.arStatus.mode === 'webxr' && this.arStatus.phase === 'surface-detected' && this.reticleGroup.visible) {
+      this.spawnEngineAtReticle();
+      return;
+    }
 
     const hit = this.pickComponent(event);
     if (hit === this.selectedComponent) {
@@ -731,7 +1310,7 @@ export class V12SceneController {
   }
 
   private onResize(): void {
-    if (this.isDisposed) return;
+    if (this.isDisposed || this.xrSession) return;
     const width = Math.max(1, this.container.clientWidth);
     const height = Math.max(1, this.container.clientHeight);
     this.camera.aspect = width / height;
@@ -742,6 +1321,21 @@ export class V12SceneController {
   public dispose(): void {
     this.isDisposed = true;
     this.stopLoop();
+    this.renderer.setAnimationLoop(null);
+    if (this.xrSession) {
+      void this.xrSession.end();
+      this.xrSession = null;
+    }
+    if (this.hitTestSource) {
+      try {
+        this.hitTestSource.cancel();
+      } catch {
+        // ignore
+      }
+      this.hitTestSource = null;
+    }
+    this.xrController.removeEventListener('select', this.handleXrSelectBound);
+
     window.removeEventListener('resize', this.handleResizeBound);
     this.renderer.domElement.removeEventListener('pointermove', this.handlePointerMoveBound);
     this.renderer.domElement.removeEventListener('pointerdown', this.handlePointerDownBound);
@@ -754,6 +1348,7 @@ export class V12SceneController {
     this.materials.dispose();
     this.textures.dispose();
     for (const g of this.studioGeos) g.dispose();
+    for (const m of this.arExtraMats) m.dispose();
     this.pmremEnv?.dispose();
     this.renderer.dispose();
     if (this.renderer.domElement.parentElement === this.container) {

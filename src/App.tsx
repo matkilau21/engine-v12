@@ -3,6 +3,8 @@ import { ViewportHUD } from './components/ViewportHUD';
 import { V12AudioSynth } from './engine/audioSynth';
 import { createEmptyCylinderTelemetry } from './engine/kinematics';
 import {
+  ArScaleMode,
+  ArStatus,
   CAMERA_PRESETS,
   CameraPresetId,
   ComponentId,
@@ -25,14 +27,24 @@ const INITIAL_TELEMETRY: EngineTelemetry = {
   cylinders: createEmptyCylinderTelemetry(),
 };
 
+const INITIAL_AR_STATUS: ArStatus = {
+  webxrSupported: false,
+  mode: 'studio',
+  phase: 'idle',
+  scaleMode: 'tabletop',
+  errorMessage: null,
+};
+
 export default function App() {
   const canvasMountRef = useRef<HTMLDivElement | null>(null);
+  const hudOverlayRef = useRef<HTMLDivElement | null>(null);
   const sceneRef = useRef<V12SceneController | null>(null);
   const audioRef = useRef<V12AudioSynth | null>(null);
   const isPlayingRef = useRef(true);
 
   const [webglError, setWebglError] = useState<string | null>(null);
   const [telemetry, setTelemetry] = useState<EngineTelemetry>(INITIAL_TELEMETRY);
+  const [arStatus, setArStatus] = useState<ArStatus>(INITIAL_AR_STATUS);
   const [isPlaying, setIsPlaying] = useState(true);
   const [targetRpm, setTargetRpm] = useState(1200);
   const [timeScale, setTimeScale] = useState(0.08);
@@ -48,7 +60,7 @@ export default function App() {
   const [hoveredComponent, setHoveredComponent] = useState<ComponentId | null>(null);
   const [hudCollapsed, setHudCollapsed] = useState(false);
 
-  // Mount Three.js WebGL scene once in dedicated isolated canvas container
+  // Mount Three.js WebGL/WebXR scene once in dedicated isolated canvas container
   useEffect(() => {
     const mount = canvasMountRef.current;
     if (!mount) return;
@@ -66,6 +78,7 @@ export default function App() {
         },
         onSelectComponent: (id) => setSelectedComponent(id),
         onHoverComponent: (id) => setHoveredComponent(id),
+        onArStatusChange: (status) => setArStatus(status),
         onRpmSync: (liveRpm) => {
           audio.update(liveRpm, isPlayingRef.current);
         },
@@ -170,6 +183,22 @@ export default function App() {
     sceneRef.current?.selectComponent(null);
   }, []);
 
+  const handleStartAr = useCallback(() => {
+    void sceneRef.current?.startArExperience(hudOverlayRef.current);
+  }, []);
+
+  const handleExitAr = useCallback(() => {
+    sceneRef.current?.exitArMode();
+  }, []);
+
+  const handleRepositionAr = useCallback(() => {
+    sceneRef.current?.repositionArEngine();
+  }, []);
+
+  const handleChangeArScale = useCallback((scaleMode: ArScaleMode) => {
+    sceneRef.current?.setArScaleMode(scaleMode);
+  }, []);
+
   // Keyboard shortcuts for engineering inspection
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -207,12 +236,12 @@ export default function App() {
   }, [handleClearSelection, handleRevBlip, handleSelectCamera, handleTogglePlay]);
 
   return (
-    <main className="relative h-screen w-screen overflow-hidden bg-[#0b0c10]">
-      {/* Dedicated WebGL Mount Container (never re-rendered by HUD state changes) */}
+    <main className="relative h-screen w-screen overflow-hidden bg-transparent">
+      {/* Dedicated WebGL/WebXR Mount Container */}
       <div
         ref={canvasMountRef}
         className="h-full w-full"
-        aria-label="Interactive 3D V12 Engine Showcase Viewport"
+        aria-label="Interactive 3D & WebXR V12 Engine Showcase Viewport"
       />
 
       {/* Graceful fallback if WebGL is unavailable */}
@@ -225,10 +254,12 @@ export default function App() {
         </div>
       )}
 
-      {/* Semantic HUD Overlay */}
+      {/* Semantic HUD Overlay (also attached as WebXR dom-overlay root) */}
       {!webglError && (
         <ViewportHUD
+          hudOverlayRef={hudOverlayRef}
           telemetry={telemetry}
+          arStatus={arStatus}
           isPlaying={isPlaying}
           targetRpm={targetRpm}
           timeScale={timeScale}
@@ -258,6 +289,10 @@ export default function App() {
           onToggleAutoRotate={handleToggleAutoRotate}
           onToggleAudio={handleToggleAudio}
           onClearSelection={handleClearSelection}
+          onStartAr={handleStartAr}
+          onExitAr={handleExitAr}
+          onRepositionAr={handleRepositionAr}
+          onChangeArScale={handleChangeArScale}
         />
       )}
     </main>

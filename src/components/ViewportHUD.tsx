@@ -1,17 +1,20 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Camera,
   ChevronDown,
   ChevronUp,
+  Crosshair,
   Eye,
   Flame,
   Gauge,
   Layers,
+  Move,
   Palette,
   Pause,
   Play,
   RotateCcw,
   RotateCw,
+  Scan,
   StepForward,
   Volume2,
   VolumeX,
@@ -19,6 +22,8 @@ import {
   Zap,
 } from 'lucide-react';
 import {
+  ArScaleMode,
+  ArStatus,
   CAMERA_PRESETS,
   CameraPresetId,
   COMPONENT_SPECS,
@@ -36,7 +41,9 @@ import {
 type DockTab = 'drive' | 'inspect' | 'atelier' | 'camera';
 
 interface ViewportHUDProps {
+  hudOverlayRef: React.RefObject<HTMLDivElement | null>;
   telemetry: EngineTelemetry;
+  arStatus: ArStatus;
   isPlaying: boolean;
   targetRpm: number;
   timeScale: number;
@@ -66,6 +73,10 @@ interface ViewportHUDProps {
   onToggleAutoRotate: () => void;
   onToggleAudio: () => void;
   onClearSelection: () => void;
+  onStartAr: () => void;
+  onExitAr: () => void;
+  onRepositionAr: () => void;
+  onChangeArScale: (scale: ArScaleMode) => void;
 }
 
 const PHASE_STYLES: Record<StrokePhase, { bg: string; label: string }> = {
@@ -89,7 +100,9 @@ const TIME_SCALES = [
 ];
 
 export const ViewportHUD: React.FC<ViewportHUDProps> = ({
+  hudOverlayRef,
   telemetry,
+  arStatus,
   isPlaying,
   targetRpm,
   timeScale,
@@ -119,10 +132,34 @@ export const ViewportHUD: React.FC<ViewportHUDProps> = ({
   onToggleAutoRotate,
   onToggleAudio,
   onClearSelection,
+  onStartAr,
+  onExitAr,
+  onRepositionAr,
+  onChangeArScale,
 }) => {
   const [activeTab, setActiveTab] = useState<DockTab>('drive');
+  const interactiveZoneRef = useRef<HTMLDivElement | null>(null);
+  const topArBarRef = useRef<HTMLDivElement | null>(null);
 
-  const isLight = LIGHTING_PRESETS.find((l) => l.id === lightingId)?.isLightTheme ?? false;
+  // Prevent WebXR DOM-overlay UI taps from firing XRController 'select' (spawn) events!
+  useEffect(() => {
+    const preventXrSelect = (e: Event) => {
+      e.preventDefault();
+    };
+    const zones = [interactiveZoneRef.current, topArBarRef.current];
+    for (const el of zones) {
+      el?.addEventListener('beforexrselect', preventXrSelect);
+    }
+    return () => {
+      for (const el of zones) {
+        el?.removeEventListener('beforexrselect', preventXrSelect);
+      }
+    };
+  }, [arStatus.mode]);
+
+  const isArActive = arStatus.mode !== 'studio';
+  const isLight =
+    !isArActive && (LIGHTING_PRESETS.find((l) => l.id === lightingId)?.isLightTheme ?? false);
 
   // Theme-paired solid/semi-opaque surfaces (zero backdrop-filter over WebGL!)
   const textPrimary = isLight ? 'text-[#111318]' : 'text-[#f3f4f6]';
@@ -144,11 +181,17 @@ export const ViewportHUD: React.FC<ViewportHUDProps> = ({
   const activeSpec = selectedComponent ? COMPONENT_SPECS[selectedComponent] : null;
   const hoverSpec = hoveredComponent ? COMPONENT_SPECS[hoveredComponent] : null;
 
+  const stopCanvasPointer = (e: React.PointerEvent) => {
+    e.stopPropagation();
+  };
+
   return (
-    <div className="pointer-events-none fixed inset-0 z-10 flex flex-col justify-between p-4 sm:p-6">
+    <div
+      ref={hudOverlayRef}
+      className="pointer-events-none fixed inset-0 z-10 flex flex-col justify-between p-4 sm:p-6"
+    >
       {/* TOP BAR: Minimal unboxed brand (top-left) & quiet live tabular telemetry (top-right) */}
       <header className="flex items-start justify-between gap-6">
-        {/* Top-Left: Clean wordmark + quiet unboxed mechanical metadata */}
         <div className="pointer-events-auto select-none">
           <h1
             className={`font-display text-2xl sm:text-3xl font-semibold tracking-wide leading-none ${textPrimary}`}
@@ -162,9 +205,15 @@ export const ViewportHUD: React.FC<ViewportHUDProps> = ({
             <span aria-hidden="true">·</span>
             <span>48V DOHC</span>
             <span aria-hidden="true" className="hidden sm:inline">·</span>
-            <span className="hidden sm:inline">9,250 RPM Redline</span>
+            <span className="hidden sm:inline">
+              {arStatus.mode === 'webxr'
+                ? 'WebXR AR'
+                : arStatus.mode === 'preview'
+                  ? 'AR Surface Preview'
+                  : '9,250 RPM Redline'}
+            </span>
           </div>
-          {hoverSpec && !activeSpec && (
+          {hoverSpec && !activeSpec && arStatus.phase !== 'scanning' && arStatus.phase !== 'surface-detected' && (
             <div className={`mt-2 text-xs ${textMuted}`}>
               Click to inspect: <span className={textPrimary}>{hoverSpec.name}</span>
             </div>
@@ -184,7 +233,6 @@ export const ViewportHUD: React.FC<ViewportHUDProps> = ({
             <span className={`text-xs font-medium ${textMuted}`}>RPM</span>
           </div>
 
-          {/* Crisp 2px tachometer bar */}
           <div
             className={`mt-1.5 h-[2px] w-36 sm:w-44 overflow-hidden ${
               isLight ? 'bg-[#111318]/12' : 'bg-white/12'
@@ -213,9 +261,103 @@ export const ViewportHUD: React.FC<ViewportHUDProps> = ({
         </div>
       </header>
 
+      {/* AR SURFACE DETECTION & PLACEMENT GUIDANCE BAR (Top-Center when in WebXR / AR Preview) */}
+      {isArActive && (
+        <div
+          ref={topArBarRef}
+          onPointerDown={stopCanvasPointer}
+          onPointerUp={stopCanvasPointer}
+          className="pointer-events-auto mx-auto mt-2 flex flex-wrap items-center justify-center gap-2.5 rounded-xl border border-white/12 bg-[#101217]/94 px-4 py-2.5 text-[#f3f4f6] shadow-xl"
+        >
+          {arStatus.phase === 'scanning' && (
+            <div className="flex items-center gap-2 text-xs font-medium">
+              <Scan className="h-4 w-4 text-[#d93829]" />
+              <span>
+                {arStatus.mode === 'webxr'
+                  ? 'Move camera slowly over a flat surface to detect plane'
+                  : 'Scanning flat surface plane…'}
+              </span>
+            </div>
+          )}
+
+          {arStatus.phase === 'surface-detected' && (
+            <div className="flex items-center gap-2 text-xs font-medium">
+              <Crosshair className="h-4 w-4 text-[#d93829]" />
+              <span>
+                {arStatus.mode === 'webxr'
+                  ? 'Flat surface detected — tap screen to spawn V12'
+                  : 'Surface detected — click anywhere on the plane to spawn V12'}
+              </span>
+            </div>
+          )}
+
+          {arStatus.phase === 'placed' && (
+            <div className="flex flex-wrap items-center gap-2 text-xs font-medium">
+              <span className="text-[#9aa1ae]">V12 Anchored</span>
+              <span aria-hidden="true" className="text-white/20">|</span>
+              <button
+                type="button"
+                onClick={onRepositionAr}
+                className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-[#1b1f27] px-2.5 py-1 text-xs text-[#f3f4f6] hover:bg-[#252a35] transition-colors whitespace-nowrap"
+              >
+                <Move className="h-3.5 w-3.5" />
+                <span>Reposition</span>
+              </button>
+              <div className="flex items-center gap-0.5 rounded-lg bg-[#191c23] p-0.5">
+                <button
+                  type="button"
+                  onClick={() => onChangeArScale('tabletop')}
+                  className={`rounded-md px-2.5 py-1 text-xs transition-colors whitespace-nowrap ${
+                    arStatus.scaleMode === 'tabletop'
+                      ? 'bg-[#f2f4f7] text-[#0e1015]'
+                      : 'text-[#9aa1ae] hover:text-white'
+                  }`}
+                >
+                  Desk Scale
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onChangeArScale('full')}
+                  className={`rounded-md px-2.5 py-1 text-xs transition-colors whitespace-nowrap ${
+                    arStatus.scaleMode === 'full'
+                      ? 'bg-[#f2f4f7] text-[#0e1015]'
+                      : 'text-[#9aa1ae] hover:text-white'
+                  }`}
+                >
+                  1:1 Real Size
+                </button>
+              </div>
+            </div>
+          )}
+
+          <button
+            type="button"
+            onClick={onExitAr}
+            className="flex items-center gap-1 rounded-lg border border-white/10 bg-[#252a35] px-2.5 py-1 text-xs font-medium text-white hover:bg-[#323846] transition-colors whitespace-nowrap"
+          >
+            <X className="h-3.5 w-3.5" />
+            <span>Exit AR</span>
+          </button>
+
+          {arStatus.errorMessage && (
+            <span className="w-full text-center text-[11px] text-[#9aa1ae]">
+              {arStatus.errorMessage}
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* Spacer keeps central 3D / AR viewport 100% unobstructed */}
+      <div className="flex-1" />
+
       {/* BOTTOM REGION: Optional Selected Component Bar + Unified Collapsible Control Dock */}
-      <div className="flex flex-col items-center">
-        {/* Selected Component Engineering Spec Strip (only shown when user clicks a 3D part) */}
+      <div
+        ref={interactiveZoneRef}
+        onPointerDown={stopCanvasPointer}
+        onPointerUp={stopCanvasPointer}
+        className="flex flex-col items-center"
+      >
+        {/* Selected Component Engineering Spec Strip */}
         {activeSpec && !hudCollapsed && (
           <div
             className={`pointer-events-auto mb-2.5 w-full max-w-[920px] rounded-xl border px-4 py-3 shadow-lg transition-opacity duration-150 ${dockBg}`}
@@ -235,9 +377,15 @@ export const ViewportHUD: React.FC<ViewportHUDProps> = ({
                 <div
                   className={`mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs font-mono-num ${textMuted}`}
                 >
-                  <span>Material: <strong className={textPrimary}>{activeSpec.material}</strong></span>
-                  <span>Mass: <strong className={textPrimary}>{activeSpec.mass}</strong></span>
-                  <span>Tolerance: <strong className={textPrimary}>{activeSpec.tolerance}</strong></span>
+                  <span>
+                    Material: <strong className={textPrimary}>{activeSpec.material}</strong>
+                  </span>
+                  <span>
+                    Mass: <strong className={textPrimary}>{activeSpec.mass}</strong>
+                  </span>
+                  <span>
+                    Tolerance: <strong className={textPrimary}>{activeSpec.tolerance}</strong>
+                  </span>
                 </div>
               </div>
               <button
@@ -278,7 +426,7 @@ export const ViewportHUD: React.FC<ViewportHUDProps> = ({
             className={`w-full overflow-hidden rounded-xl border shadow-2xl transition-all duration-200 ${dockBg} ${
               hudCollapsed
                 ? 'max-h-0 opacity-0 border-transparent pointer-events-none translate-y-4'
-                : 'max-h-[260px] opacity-100 translate-y-0'
+                : 'max-h-[280px] opacity-100 translate-y-0'
             }`}
           >
             {/* Dock Tab Row + Quick Action Bar */}
@@ -294,8 +442,10 @@ export const ViewportHUD: React.FC<ViewportHUDProps> = ({
                     { id: 'drive', label: 'Drive', icon: Gauge },
                     { id: 'inspect', label: 'Inspect', icon: Layers },
                     { id: 'atelier', label: 'Atelier', icon: Palette },
-                    { id: 'camera', label: 'Camera', icon: Camera },
-                  ] as const
+                    ...(arStatus.mode === 'webxr'
+                      ? []
+                      : [{ id: 'camera', label: 'Camera', icon: Camera } as const]),
+                  ] as { id: DockTab; label: string; icon: React.ComponentType<{ className?: string }> }[]
                 ).map(({ id, label, icon: Icon }) => (
                   <button
                     key={id}
@@ -311,8 +461,30 @@ export const ViewportHUD: React.FC<ViewportHUDProps> = ({
                 ))}
               </div>
 
-              {/* Persistent Quick Engineering Actions */}
+              {/* Persistent Quick Engineering & WebXR Actions */}
               <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={isArActive ? onExitAr : onStartAr}
+                  className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                    isArActive ? btnActive : btnIdle
+                  }`}
+                  title={
+                    arStatus.webxrSupported
+                      ? 'Launch WebXR AR surface placement'
+                      : 'Enter AR surface detection & click-to-spawn mode'
+                  }
+                >
+                  <Scan className="h-3.5 w-3.5" />
+                  <span>
+                    {isArActive
+                      ? 'Exit AR'
+                      : arStatus.webxrSupported
+                        ? 'Launch WebXR AR'
+                        : 'AR Surface Spawn'}
+                  </span>
+                </button>
+
                 <button
                   type="button"
                   onClick={onTogglePlay}
@@ -353,7 +525,6 @@ export const ViewportHUD: React.FC<ViewportHUDProps> = ({
               {activeTab === 'drive' && (
                 <div className="flex flex-col gap-3">
                   <div className="flex flex-wrap items-center gap-4">
-                    {/* RPM Slider */}
                     <div className="flex min-w-[200px] flex-1 items-center gap-3">
                       <span className={`text-xs font-medium whitespace-nowrap ${textSecondary}`}>
                         Throttle
@@ -373,7 +544,6 @@ export const ViewportHUD: React.FC<ViewportHUDProps> = ({
                       </span>
                     </div>
 
-                    {/* RPM Presets */}
                     <div className="flex items-center gap-1">
                       {RPM_PRESETS.map((p) => (
                         <button
@@ -400,7 +570,6 @@ export const ViewportHUD: React.FC<ViewportHUDProps> = ({
                       )}
                     </div>
 
-                    {/* Kinematics Time Scale */}
                     <div className={`flex items-center gap-1 rounded-lg p-0.5 ${subSurface}`}>
                       {TIME_SCALES.map((s) => (
                         <button
@@ -417,7 +586,7 @@ export const ViewportHUD: React.FC<ViewportHUDProps> = ({
                     </div>
                   </div>
 
-                  {/* Live 12-Cylinder Firing Order Matrix (1-12-5-8-3-10-6-7-2-11-4-9) */}
+                  {/* Live 12-Cylinder Firing Order Matrix */}
                   <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">
                     <div className="flex items-center gap-2 text-[11px]">
                       <span className={`font-medium ${textMuted}`}>Firing Order</span>
@@ -458,10 +627,9 @@ export const ViewportHUD: React.FC<ViewportHUDProps> = ({
                 </div>
               )}
 
-              {/* TAB 2: INSPECT (Cutaway, X-Ray, Exploded Slider, Combustion, Turntable) */}
+              {/* TAB 2: INSPECT */}
               {activeTab === 'inspect' && (
                 <div className="flex flex-wrap items-center justify-between gap-4">
-                  {/* View Mode Selector */}
                   <div className="flex items-center gap-2">
                     <span className={`text-xs font-medium whitespace-nowrap ${textSecondary}`}>
                       Housing
@@ -488,7 +656,6 @@ export const ViewportHUD: React.FC<ViewportHUDProps> = ({
                     </div>
                   </div>
 
-                  {/* Continuous Exploded Assembly Slider */}
                   <div className="flex min-w-[210px] flex-1 items-center gap-3">
                     <span className={`text-xs font-medium whitespace-nowrap ${textSecondary}`}>
                       Exploded
@@ -508,7 +675,6 @@ export const ViewportHUD: React.FC<ViewportHUDProps> = ({
                     </span>
                   </div>
 
-                  {/* Combustion & Turntable Toggles */}
                   <div className="flex items-center gap-1.5">
                     <button
                       type="button"
@@ -520,24 +686,25 @@ export const ViewportHUD: React.FC<ViewportHUDProps> = ({
                       <Flame className="h-3.5 w-3.5" />
                       <span>Combustion</span>
                     </button>
-                    <button
-                      type="button"
-                      onClick={onToggleAutoRotate}
-                      className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                        autoRotate ? btnActive : btnIdle
-                      }`}
-                    >
-                      <RotateCw className="h-3.5 w-3.5" />
-                      <span>Turntable</span>
-                    </button>
+                    {!isArActive && (
+                      <button
+                        type="button"
+                        onClick={onToggleAutoRotate}
+                        className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                          autoRotate ? btnActive : btnIdle
+                        }`}
+                      >
+                        <RotateCw className="h-3.5 w-3.5" />
+                        <span>Turntable</span>
+                      </button>
+                    )}
                   </div>
                 </div>
               )}
 
-              {/* TAB 3: ATELIER CONFIGURATOR (Finishes & Lighting Studio) */}
+              {/* TAB 3: ATELIER CONFIGURATOR */}
               {activeTab === 'atelier' && (
                 <div className="flex flex-wrap items-center justify-between gap-4">
-                  {/* Bespoke Finish Presets */}
                   <div className="flex flex-wrap items-center gap-2">
                     <span className={`text-xs font-medium whitespace-nowrap ${textSecondary}`}>
                       Trim
@@ -566,31 +733,32 @@ export const ViewportHUD: React.FC<ViewportHUDProps> = ({
                     })}
                   </div>
 
-                  {/* Studio Lighting Rig */}
-                  <div className="flex items-center gap-2">
-                    <span className={`text-xs font-medium whitespace-nowrap ${textSecondary}`}>
-                      Studio
-                    </span>
-                    <div className={`flex items-center gap-1 rounded-lg p-0.5 ${subSurface}`}>
-                      {LIGHTING_PRESETS.map((l) => (
-                        <button
-                          key={l.id}
-                          type="button"
-                          onClick={() => onChangeLighting(l.id)}
-                          className={`rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                            lightingId === l.id ? btnActive : textSecondary
-                          }`}
-                        >
-                          {l.name}
-                        </button>
-                      ))}
+                  {arStatus.mode !== 'webxr' && (
+                    <div className="flex items-center gap-2">
+                      <span className={`text-xs font-medium whitespace-nowrap ${textSecondary}`}>
+                        Studio
+                      </span>
+                      <div className={`flex items-center gap-1 rounded-lg p-0.5 ${subSurface}`}>
+                        {LIGHTING_PRESETS.map((l) => (
+                          <button
+                            key={l.id}
+                            type="button"
+                            onClick={() => onChangeLighting(l.id)}
+                            className={`rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                              lightingId === l.id ? btnActive : textSecondary
+                            }`}
+                          >
+                            {l.name}
+                          </button>
+                        ))}
+                      </div>
                     </div>
-                  </div>
+                  )}
                 </div>
               )}
 
               {/* TAB 4: CAMERA CHOREOGRAPHY */}
-              {activeTab === 'camera' && (
+              {activeTab === 'camera' && arStatus.mode !== 'webxr' && (
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="flex flex-wrap items-center gap-1.5">
                     {CAMERA_PRESETS.map((cam, idx) => (

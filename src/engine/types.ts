@@ -8,6 +8,20 @@ export type CameraPresetId = 'hero' | 'valvetrain' | 'crank' | 'headers' | 'inta
 
 export type StrokePhase = 'intake' | 'compression' | 'power' | 'exhaust';
 
+export type ArMode = 'studio' | 'webxr' | 'preview';
+
+export type ArPlacementPhase = 'idle' | 'scanning' | 'surface-detected' | 'placed';
+
+export type ArScaleMode = 'tabletop' | 'full';
+
+export interface ArStatus {
+  webxrSupported: boolean;
+  mode: ArMode;
+  phase: ArPlacementPhase;
+  scaleMode: ArScaleMode;
+  errorMessage: string | null;
+}
+
 export type ComponentId =
   | 'valveCovers'
   | 'intakePlenums'

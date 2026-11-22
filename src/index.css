@@ -20,6 +20,12 @@
     user-select: none;
     -webkit-user-select: none;
   }
+
+  html.xr-active,
+  html.xr-active body,
+  html.xr-active #root {
+    background-color: transparent !important;
+  }
 }
 
 .font-display {
