@@ -1,0 +1,6 @@
+{
+  "name": "Atelier V12",
+  "description": "Real-time interactive 3D V12 engine showcase and mechanical engineering visualiser built in Three.js with studio-grade PBR materials, authentic 60-degree kinematics, cutaway inspection, and exploded assembly.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
